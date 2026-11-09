@@ -51,9 +51,9 @@ window.addEventListener('error',e=>log('ERR '+(e.message||e)));window.addEventLi
 log('page loaded · '+(navigator.userAgent.match(/(iPhone|Android)[^;)]*/)||['?'])[0]+(window.WebAssembly?' wasm ok':' NO WASM'));
 let tick=null;function setBusyTimer(t){clearInterval(tick);if(!t)return;const s0=Date.now();tick=setInterval(()=>{$('#busyT').textContent=t+' '+Math.round((Date.now()-s0)/1000)+'s';},500);}
 let BRAND='Avery Dennison',Q='',FILMS=[],film=null,finish='gloss',stream=null;
-let samErr='';let frame=null,mask=null,points=[],aiImg=null,showAI=false,sam=null,embeddings=null,samInputs=null,busy=false;
+let frame=null,mask=null,points=[],aiImg=null,showAI=false,sam=null,embeddings=null,samInputs=null,busy=false;
 const video=$('#video'),cv=$('#cv'),ctx=cv.getContext('2d',{willReadFrequently:true});
-const PW=768;
+const PW=640;
 function setBusy(t){busy=!!t;$('#busy').classList.toggle('on',busy);if(t)$('#busyT').textContent=t;setBusyTimer(t);if(t)log(t);}
 function buildFilms(){FILMS=LIB[BRAND].filter(f=>!Q||(f[1]+' '+f[0]).toLowerCase().includes(Q));const el=$('#films');el.innerHTML='';
   FILMS.forEach(f=>{const b=document.createElement('button');b.className='film';b.setAttribute('aria-pressed',String(film&&film[0]===f[0]));b.innerHTML=`<div class="sw" style="background:${f[2]}"></div><span>${f[1]}</span>`;b.onclick=()=>{film=f;finish=f[3];[...el.children].forEach(c=>c.setAttribute('aria-pressed','false'));b.setAttribute('aria-pressed','true');
@@ -75,44 +75,38 @@ $('#big').onclick=()=>{const vw=video.videoWidth,vh=video.videoHeight;log('shutt
   cv.width=PW;cv.height=Math.round(PW*vh/vw);ctx.drawImage(video,0,0,cv.width,cv.height);frame=ctx.getImageData(0,0,cv.width,cv.height);
   mask=null;points=[];embeddings=null;aiImg=null;showAI=false;cv.hidden=false;video.style.visibility='hidden';$('#big').hidden=true;
   for(const id of['retake','undo','shot','share','ai'])$('#'+id).disabled=false;
-  $('#msg').textContent=sam?'Tap the car\'s paint.':'Loading outline model… tap the paint when ready.';
-  embedFrame();};
+  $('#msg').textContent=sam?'Tap the car\'s paint.':'Loading outline model… tap the paint when ready.';};
 $('#retake').onclick=()=>{frame=null;mask=null;points=[];aiImg=null;showAI=false;cv.hidden=true;video.style.visibility='';$('#big').hidden=false;for(const id of['retake','undo','shot','share','ai'])$('#'+id).disabled=true;$('#msg').textContent='Frame the car, then press the shutter.';};
 
-// ---- Segment Anything (SlimSAM via transformers.js) ----
-let T=null;
+// ---- Tap-to-outline: MediaPipe Interactive Segmenter (MagicTouch, ~5 MB, built for phones) ----
+let segm=null,samErr='';
 async function loadSam(){
-  try{$('#msg').textContent='Frame the car, then press the shutter. (Loading outline model, ~40 MB first time…)';
-    log('importing transformers.js');T=await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3');log('transformers '+(T.env?.version||'ok'));
-    const id='Xenova/slimsam-77-uniform';
-    T.env.allowLocalModels=false;let model;const prog={progress_callback:d=>{if(d.status==='progress'&&d.file&&d.file.endsWith('.onnx'))$('#msg').textContent='Loading outline model… '+Math.round(d.progress||0)+'%';}};
-    try{model=await T.SamModel.from_pretrained(id,{dtype:'q8',device:'wasm',...prog});}catch(e){console.warn('wasm q8',e);model=await T.SamModel.from_pretrained(id,{dtype:'fp32',device:'wasm',...prog});}
-    const processor=await T.AutoProcessor.from_pretrained(id);sam={model,processor};log('model ready');
-    $('#msg').textContent=frame?'Tap the car\'s paint.':'Ready. Frame the car, then press the shutter.';
-    if(frame&&!embeddings)embedFrame();}
-  catch(e){console.warn('sam',e);sam=null;samErr=String(e.message||e);$('#msg').textContent='Outline model unavailable ('+(e.message||e)+'). Photo-real still works.';}
+  try{log('importing mediapipe');const {InteractiveSegmenter,FilesetResolver}=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14');
+    const vision=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    const opts=d=>({baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/interactive_segmenter/magic_touch/float32/1/magic_touch.tflite',delegate:d},outputCategoryMask:true,outputConfidenceMasks:false});
+    try{segm=await InteractiveSegmenter.createFromOptions(vision,opts('GPU'));log('outline model ready (GPU)');}
+    catch(e){log('GPU failed, trying CPU');segm=await InteractiveSegmenter.createFromOptions(vision,opts('CPU'));log('outline model ready (CPU)');}
+    sam=true;$('#msg').textContent=frame?'Tap the car\'s paint.':'Ready. Frame the car, then press the shutter.';}
+  catch(e){console.warn('seg',e);sam=null;samErr=String(e.message||e);log('outline model failed: '+samErr);$('#msg').textContent='Outline model unavailable. Photo-real still works.';}
 }
-async function embedFrame(){if(!sam||!frame||busy)return;setBusy('Reading the car… (20–60 s on a phone)');
-  try{const img=new T.RawImage(new Uint8ClampedArray(frame.data),frame.width,frame.height,4);samInputs=await sam.processor(img);embeddings=await sam.model.get_image_embeddings(samInputs);log('embedding done');$('#msg').textContent='Tap the car\'s paint.';}
-  catch(e){console.warn('embed',e);$('#msg').textContent='Outline failed: '+(e.message||e);}
-  setBusy(null);if(points.length)segment();}
-async function segment(){if(!sam||!embeddings||!points.length||busy){log('segment skipped sam='+!!sam+' emb='+!!embeddings+' pts='+points.length+' busy='+busy);return;}setBusy('Outlining…');
-  try{const n=points.length;const[oh,ow]=samInputs.original_sizes[0],[rh,rw]=samInputs.reshaped_input_sizes[0];const sx=rw/ow,sy=rh/oh;
-    const input_points=new T.Tensor('float32',points.flatMap(p=>[p.x*sx,p.y*sy]),[1,1,n,2]);const input_labels=new T.Tensor('int64',points.map(p=>BigInt(p.l)),[1,1,n]);
-    const out=await sam.model({...embeddings,input_points,input_labels});
-    const masks=(await sam.processor.post_process_masks(out.pred_masks,samInputs.original_sizes,samInputs.reshaped_input_sizes))[0][0]; // [3,H,W]
-    const scores=out.iou_scores.data;let best=0;for(let i=1;i<scores.length;i++)if(scores[i]>scores[best])best=i;
-    const H=masks.dims[1],W=masks.dims[2],data=masks.data;mask=new Uint8Array(W*H);const off=best*W*H;let cnt=0;for(let i=0;i<W*H;i++){const v=data[off+i];if(v>0){mask[i]=1;cnt++;}}
-    if(W!==frame.width||H!==frame.height){const m2=new Uint8Array(frame.width*frame.height);for(let y=0;y<frame.height;y++)for(let x=0;x<frame.width;x++)m2[y*frame.width+x]=mask[((y*H/frame.height)|0)*W+((x*W/frame.width)|0)];mask=m2;}
-    if(!cnt){$('#msg').textContent='No outline found at that spot. Try tapping the middle of a door or bonnet.';setBusy(null);render();return;}
-    $('#msg').textContent=`${n} tap${n>1?'s':''} · outline ${Math.round(100*cnt/(W*H))}% of frame (score ${(scores[best]).toFixed(2)}). Tap more paint to extend; hold to exclude.`;}
-  catch(e){console.warn('seg',e);$('#msg').textContent='Outline failed: '+String(e.message||e).slice(0,160);}
-  setBusy(null);showAI=false;render();}
+async function embedFrame(){embeddings=true;if(points.length)segment();}
+async function segment(){if(!segm||!frame||!points.length||busy){log('segment skipped');return;}setBusy('Outlining…');
+  try{const W=frame.width,H=frame.height;const tmp=document.createElement('canvas');tmp.width=W;tmp.height=H;tmp.getContext('2d').putImageData(frame,0,0);
+    const acc=new Uint8Array(W*H);
+    for(const p of points){const res=segm.segment(tmp,{keypoint:{x:p.x/W,y:p.y/H}});const m=res.categoryMask;const mw=m.width,mh=m.height,u=m.getAsUint8Array();
+      for(let y=0;y<H;y++){const sy=((y*mh/H)|0)*mw;for(let x=0;x<W;x++){const v=u[sy+((x*mw/W)|0)]>0;if(p.l===1&&v)acc[y*W+x]=1;else if(p.l===0&&v)acc[y*W+x]=0;}}
+      res.close();}
+    let cnt=0;for(let i=0;i<W*H;i++)cnt+=acc[i];mask=acc;
+    if(!cnt){$('#msg').textContent='No outline found there. Tap the middle of a door or bonnet.';}
+    else $('#msg').textContent=`${points.length} tap${points.length>1?'s':''} · outline ${Math.round(100*cnt/(W*H))}% of frame. Tap more paint to extend; hold to exclude.`;
+    log('outline '+cnt+' px');}
+  catch(e){console.warn('seg',e);log('outline error '+(e.message||e));$('#msg').textContent='Outline failed: '+String(e.message||e).slice(0,160);}
+  setBusy(null);showAI=false;render();drawDots();}
 let pressT=0;
 cv.addEventListener('pointerdown',e=>{pressT=Date.now();});
 cv.addEventListener('pointerup',e=>{log('tap');if(!frame)return;if(busy){$('#msg').textContent='Still working, one moment…';return;}const r=cv.getBoundingClientRect();const sc=Math.max(r.width/cv.width,r.height/cv.height),ox=(r.width-cv.width*sc)/2,oy=(r.height-cv.height*sc)/2;
   const x=Math.round((e.clientX-r.left-ox)/sc),y=Math.round((e.clientY-r.top-oy)/sc);if(x<0||y<0||x>=cv.width||y>=cv.height)return;
-  points.push({x,y,l:Date.now()-pressT>450?0:1});drawDots();if(!sam){$('#msg').textContent='Outline model not loaded: '+(samErr||'still downloading');return;}if(!embeddings){$('#msg').textContent='Reading the car, your tap is queued…';return;}segment();});
+  points.push({x,y,l:Date.now()-pressT>450?0:1});drawDots();if(!sam){$('#msg').textContent='Outline model not loaded: '+(samErr||'still downloading');return;}segment();});
 function drawDots(){ctx.fillStyle='#ffb000';for(const p of points){ctx.beginPath();ctx.arc(p.x,p.y,6,0,7);ctx.fill();}}
 $('#undo').onclick=()=>{points.pop();if(points.length)segment();else{mask=null;render();}};
 
